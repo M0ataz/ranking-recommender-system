@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test:
+    name: Smoke Test — Train & Verify Model
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run training smoke test (synthetic data, small scale)
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+        run: |
+          python scripts/train.py \
+            --num-users 200 \
+            --num-items 500 \
+            --num-interactions 5000 \
+            --factors 32 \
+            --iterations 5 \
+            --k 5 10
+
+      - name: Verify model artifact was created
+        run: |
+          if [ ! -f models/als_model.pkl ]; then
+            echo "ERROR: models/als_model.pkl was not created by train.py"
+            exit 1
+          fi
+          echo "OK: models/als_model.pkl exists ($(du -sh models/als_model.pkl | cut -f1))"
+
+      - name: Verify evaluation metrics were saved
+        run: |
+          if [ ! -f models/eval_metrics.json ]; then
+            echo "ERROR: models/eval_metrics.json was not created"
+            exit 1
+          fi
+          echo "OK: models/eval_metrics.json contents:"
+          cat models/eval_metrics.json
+
+      - name: Test recommend() Python interface
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+        run: |
+          python - <<'EOF'
+          import sys, os
+          sys.path.insert(0, os.getcwd())
+          from src.recommend import recommend
+
+          # Known user
+          recs = recommend(user_id=0, top_k=10)
+          assert len(recs) == 10, f"Expected 10 recs, got {len(recs)}"
+          assert recs[0]["rank"] == 1, "First rank must be 1"
+          assert recs[0]["score"] >= recs[-1]["score"], "Scores must be in descending order"
+          assert recs[0]["cold_start"] is False, "Known user should not be cold-start"
+          print(f"Known user (id=0): top rec = item {recs[0]['item_id']} (score={recs[0]['score']:.4f})")
+
+          # Cold-start user
+          cold_recs = recommend(user_id=999999, top_k=10)
+          assert len(cold_recs) == 10, f"Expected 10 cold-start recs, got {len(cold_recs)}"
+          assert cold_recs[0]["cold_start"] is True, "Unknown user must be cold-start"
+          print(f"Cold-start user (id=999999): top rec = item {cold_recs[0]['item_id']}")
+
+          print("All assertions passed.")
+          EOF
+
+      - name: Start API and run endpoint tests
+        env:
+          OPENBLAS_NUM_THREADS: "1"
+        run: |
+          uvicorn api.app:app --host 0.0.0.0 --port 8000 &
+          sleep 5
+
+          # Health check
+          STATUS=$(curl -sf http://localhost:8000/health | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['status'])")
+          [ "$STATUS" = "ok" ] || { echo "Health check failed: $STATUS"; exit 1; }
+          echo "OK: /health -> $STATUS"
+
+          # Known user recommendation
+          RECS=$(curl -sf "http://localhost:8000/recommend/0?top_k=5")
+          echo "OK: /recommend/0 -> $RECS"
+          COLD=$(echo "$RECS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['cold_start'])")
+          [ "$COLD" = "False" ] || { echo "Expected cold_start=False for user 0"; exit 1; }
+
+          # Cold-start user
+          COLD_RECS=$(curl -sf "http://localhost:8000/recommend/999999?top_k=5")
+          echo "OK: /recommend/999999 -> $COLD_RECS"
+          IS_COLD=$(echo "$COLD_RECS" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['cold_start'])")
+          [ "$IS_COLD" = "True" ] || { echo "Expected cold_start=True for user 999999"; exit 1; }
+
+          echo "All API endpoint tests passed."
