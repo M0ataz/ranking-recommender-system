@@ -18,6 +18,7 @@ env/
 *.pth
 models/*.pkl
 data/*.csv
+data/*.zip
 .DS_Store
 .idea/
 .vscode/

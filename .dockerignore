@@ -1,0 +1,14 @@
+.git
+.github
+__pycache__
+*.py[cod]
+*.pyo
+*.egg-info
+.env
+.venv
+venv/
+*.log
+models/*.pkl
+data/*.csv
+data/*.zip
+README.md
